@@ -47,8 +47,17 @@ from ...utils import (
     logging,
     replace_return_docstrings,
 )
-from ...utils.deprecation import deprecate_kwarg
 from .configuration_llama import LlamaConfig
+
+
+try:
+    import flash_attn
+    from flash_attn.flash_attn_interface import _flash_attn_forward
+    from flash_attn.flash_attn_interface import flash_attn_with_kvcache
+except ImportError:
+    flash_attn = None
+    flash_attn_varlen_func = None
+    _flash_attn_forward = None
 
 
 logger = logging.get_logger(__name__)
@@ -111,9 +120,6 @@ class LlamaRotaryEmbedding(nn.Module):
             self.max_seq_len_cached = seq_len
 
         if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:  # reset
-            # This .to() is needed if the model has been moved to a device after being initialized (because
-            # the buffer is automatically moved, but not the original copy)
-            self.original_inv_freq = self.original_inv_freq.to(device)
             self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
             self.max_seq_len_cached = self.original_max_seq_len
 
@@ -264,41 +270,97 @@ class LlamaAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        plan9 = kwargs.get("plan9", False)
+
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)        
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+        if plan9:
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+
+            start_positions = kwargs["start_positions"] 
+            seq_lengths = kwargs["seq_lengths"]
+            kv_cache = kwargs["kv_cache"]
+            k_cache =  kv_cache["k_list"][self.layer_idx]
+            v_cache =  kv_cache["v_list"][self.layer_idx]
+            any_guidance = kwargs["any_guidance"]
+
+            if query_states.shape[1] == 1 or not any_guidance:
+                attn_output = flash_attn_with_kvcache(
+                    q= query_states,
+                    k_cache= k_cache,
+                    v_cache= v_cache,
+                    k= key_states,
+                    v= value_states,
+                    cache_seqlens= seq_lengths,
+                    cache_leftpad= start_positions,
+                    causal= True,
                 )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+            else:
+                attn0 = flash_attn_with_kvcache(
+                    q= query_states[0: 1],
+                    k_cache= k_cache[0: 1],
+                    v_cache= v_cache[0: 1],
+                    k= key_states[0: 1],
+                    v= value_states[0: 1],
+                    cache_seqlens= seq_lengths[0: 1],
+                    cache_leftpad= start_positions[0: 1],
+                    causal= True,
+                )
+
+                attn1 = flash_attn_with_kvcache(
+                    q= query_states[1: 2, -1:, ... ],
+                    k_cache= k_cache[1: 2],
+                    v_cache= v_cache[1: 2],
+                    k= key_states[1: 2, -1:, ... ],
+                    v= value_states[1: 2, -1:, ... ],
+                    cache_seqlens= seq_lengths[1: 2],
+                    cache_leftpad= start_positions[1: 2],
+                    causal= True,
+                )
+                attn1ext = torch.zeros_like(attn0)
+                attn1ext[:, -1:, ...] = attn1
+                attn_output = torch.cat([attn0, attn1ext], 0)
+            attn_weights = None
+        else:
+            if past_key_value is not None:
+                # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+            attention_interface: Callable = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+                    logger.warning_once(
+                        "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                        'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                    )
+                else:
+                    attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -330,8 +392,9 @@ class LlamaDecoderLayer(nn.Module):
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states) 
 
+        # return (hidden_states,)
         # Self Attention
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
@@ -354,6 +417,7 @@ class LlamaDecoderLayer(nn.Module):
 
         outputs = (hidden_states,)
         if output_attentions:
+            pass
             outputs += (self_attn_weights,)
 
         return outputs
@@ -392,7 +456,6 @@ class LlamaPreTrainedModel(PreTrainedModel):
     _supports_cache_class = True
     _supports_quantized_cache = True
     _supports_static_cache = True
-    _supports_attention_backend = True
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -528,6 +591,10 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        unconditional_guidance = 0,
+        unconditional_past_key_values: Optional[Cache] = None,
+        unconditional_cache_position: Optional[torch.LongTensor] = None,
+        prompt_length = 0,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -536,39 +603,70 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        plan9 =flash_attn_kwargs.get("plan9", False)
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning_once(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
-            )
-            use_cache = False
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
+        if not plan9:
+            if self.gradient_checkpointing and self.training and use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+                )
+                use_cache = False
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            if use_cache and past_key_values is None:
+                past_key_values = DynamicCache()
+
+            if cache_position is None:
+                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+                cache_position = torch.arange(
+                    past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                )
+
+
+            if position_ids is None:
+                position_ids = cache_position.unsqueeze(0)
+
+
+            hidden_states = inputs_embeds
+
+            # create position embeddings to be shared across the decoder layers
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+            causal_mask = self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
             )
 
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            if unconditional_guidance > 0 :
+                unconditional_hidden_states = hidden_states[:, -1:, :]
+                past_seen_tokens = unconditional_past_key_values.get_seq_length() if unconditional_past_key_values is not None else 0
+                unconditional_position_ids = torch.full( (inputs_embeds.shape[0],1) , past_seen_tokens, dtype= torch.int64, device=inputs_embeds.device )
+                unconditional_position_embeddings = self.rotary_emb(unconditional_hidden_states, unconditional_position_ids)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
+        else:
+            kwargs = flash_attn_kwargs
+            hidden_states = inputs_embeds
+            position_embeddings =  self.rotary_emb(hidden_states, position_ids)
+            causal_mask = None
+            kv_cache =  kwargs["kv_cache"]
+            if len(kv_cache) == 0:
+                real_max_length = kwargs["real_max_length"]
+                v_list = []
+                k_list = []
+                head_dim = self.config.head_dim
+                num_key_value_heads = self.config.num_key_value_heads
+                for _ in range(self.config.num_hidden_layers): #self.config.head_dim
+                    k_list.append( torch.zeros(hidden_states.shape[0], real_max_length, num_key_value_heads ,
+                                                head_dim , dtype= hidden_states.dtype, device= hidden_states.device ) ) 
+                    v_list.append( torch.zeros(hidden_states.shape[0], real_max_length, num_key_value_heads ,
+                                            head_dim , dtype= hidden_states.dtype, device= hidden_states.device ) ) 
+                kv_cache["k_list"] = k_list
+                kv_cache["v_list"] = v_list
+        
 
-        hidden_states = inputs_embeds
-
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -603,12 +701,30 @@ class LlamaModel(LlamaPreTrainedModel):
                     **flash_attn_kwargs,
                 )
 
+                if unconditional_guidance > 0 :
+                    unconditional_layer_outputs = decoder_layer(
+                        unconditional_hidden_states,
+                        attention_mask=None,
+                        position_ids=unconditional_position_ids,
+                        past_key_value=unconditional_past_key_values,
+                        output_attentions=None,
+                        use_cache=use_cache,
+                        cache_position=unconditional_cache_position,
+                        position_embeddings=unconditional_position_embeddings,
+                        **flash_attn_kwargs,
+                    )
+
+
             hidden_states = layer_outputs[0]
+            if unconditional_guidance > 0 :
+                unconditional_hidden_states = unconditional_layer_outputs[0]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
+        if unconditional_guidance > 0 :
+            unconditional_hidden_states = self.norm(unconditional_hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -620,6 +736,11 @@ class LlamaModel(LlamaPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
+
+        if unconditional_guidance > 0 :
+            output["last_unconditional_hidden_state"] = unconditional_hidden_states
+            output["unconditional_past_key_values"]=  unconditional_past_key_values if use_cache else None,
+
         return output if return_dict else output.to_tuple()
 
     def _update_causal_mask(
@@ -631,6 +752,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_attentions: bool,
     ):
         if self.config._attn_implementation == "flash_attention_2":
+            #############
             if attention_mask is not None and (attention_mask == 0.0).any():
                 return attention_mask
             return None
@@ -676,7 +798,7 @@ class LlamaModel(LlamaPreTrainedModel):
         if (
             self.config._attn_implementation == "sdpa"
             and attention_mask is not None
-            and attention_mask.device.type in ["cuda", "xpu"]
+            and attention_mask.device.type == "cuda"
             and not output_attentions
         ):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
@@ -778,7 +900,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
-    @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -794,7 +915,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        num_logits_to_keep: int = 0,
+        unconditional_guidance = 0,
+        unconditional_past_key_values: Optional[Cache] = None,
+        unconditional_cache_position: Optional[torch.LongTensor] = None,
+        prompt_length = 0,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -804,12 +929,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
                 (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
 
-            logits_to_keep (`int` or `torch.Tensor`, *optional*):
-                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
+            num_logits_to_keep (`int`, *optional*):
+                Calculate logits for the last `num_logits_to_keep` tokens. If `0`, calculate logits for all
                 `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
                 token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
-                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
-                This is useful when using packed tensor format (single dimension for batch and sequence length).
 
         Returns:
 
@@ -847,13 +970,16 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            unconditional_guidance=unconditional_guidance,
+            unconditional_past_key_values = unconditional_past_key_values,
+            unconditional_cache_position = unconditional_cache_position,
+            prompt_length = prompt_length,
             **kwargs,
         )
 
         hidden_states = outputs[0]
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
 
         loss = None
         if labels is not None:
@@ -863,15 +989,21 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        ret = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-
+    
+        if unconditional_guidance > 0:
+            unconditional_hidden_states = outputs["last_unconditional_hidden_state"]
+            unconditional_past_key_values = outputs["unconditional_past_key_values"]
+            unconditional_logits = self.lm_head(unconditional_hidden_states[:, -num_logits_to_keep:, :])
+            ret["unconditional_logits"] = unconditional_logits
+            ret["unconditional_past_key_values"] = unconditional_past_key_values
+        return ret
 @add_start_docstrings(
     """
     The LLaMa Model transformer with a sequence classification head on top (linear layer).
@@ -947,20 +1079,17 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
         if self.config.pad_token_id is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
         if self.config.pad_token_id is None:
-            last_non_pad_token = -1
-        elif input_ids is not None:
-            # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
-            non_pad_mask = (input_ids != self.config.pad_token_id).to(logits.device, torch.int32)
-            token_indices = torch.arange(input_ids.shape[-1], device=logits.device)
-            last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
+            sequence_lengths = -1
         else:
-            last_non_pad_token = -1
-            logger.warning_once(
-                f"{self.__class__.__name__} will not detect padding tokens in `inputs_embeds`. Results may be "
-                "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
-            )
+            if input_ids is not None:
+                # if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
+                sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+                sequence_lengths = sequence_lengths % input_ids.shape[-1]
+                sequence_lengths = sequence_lengths.to(logits.device)
+            else:
+                sequence_lengths = -1
 
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), last_non_pad_token]
+        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
 
         loss = None
         if labels is not None:
