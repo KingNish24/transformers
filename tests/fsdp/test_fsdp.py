@@ -14,6 +14,7 @@
 
 import itertools
 import os
+import subprocess
 import unittest
 from copy import deepcopy
 from functools import partial
@@ -194,11 +195,7 @@ class TrainerIntegrationFSDP(TestCasePlus, TrainerIntegrationCommon):
             self.assertEqual(trainer.args.fsdp[0], sharding_strategy)
             self.assertEqual(trainer.args.fsdp[1], FSDPOption.OFFLOAD)
             self.assertEqual(trainer.args.fsdp[2], FSDPOption.AUTO_WRAP)
-            fsdp_sharding_strategy = (
-                str(FSDP_SHARDING_STRATEGY.index(sharding_strategy.upper()) + 1)
-                if is_accelerate_available("0.26.0")
-                else sharding_strategy.upper()
-            )
+            fsdp_sharding_strategy = str(FSDP_SHARDING_STRATEGY.index(sharding_strategy.upper()) + 1)
             self.assertEqual(os.environ[f"{prefix}SHARDING_STRATEGY"], fsdp_sharding_strategy)
             self.assertEqual(os.environ[f"{prefix}OFFLOAD_PARAMS"], "true")
             self.assertEqual(os.environ[f"{prefix}AUTO_WRAP_POLICY"], "TRANSFORMER_BASED_WRAP")
@@ -221,6 +218,18 @@ class TrainerIntegrationFSDP(TestCasePlus, TrainerIntegrationCommon):
         launcher = get_launcher(distributed=True, use_accelerate=False)
         output_dir = self.get_auto_remove_tmp_dir()
         args = self.get_base_args(output_dir, 1, 50).split() + [f"--{dtype}"]
+        fsdp_args = ["--fsdp", f"{sharding_strategy} auto_wrap", "--fsdp_transformer_layer_cls_to_wrap", "BertLayer"]
+        script = [f"{self.examples_dir_str}/pytorch/text-classification/run_glue.py"]
+        cmd = launcher + script + args + fsdp_args
+        execute_subprocess_async(cmd, env=self.get_env())
+
+    @parameterized.expand(params, name_func=_parameterized_custom_name_func)
+    @require_torch_multi_accelerator
+    @slow
+    def test_basic_run_with_gradient_accumulation(self, sharding_strategy, dtype):
+        launcher = get_launcher(distributed=True, use_accelerate=False)
+        output_dir = self.get_auto_remove_tmp_dir()
+        args = self.get_base_args(output_dir, 1, 50).split() + [f"--{dtype}", "--gradient_accumulation_steps", "2"]
         fsdp_args = ["--fsdp", f"{sharding_strategy} auto_wrap", "--fsdp_transformer_layer_cls_to_wrap", "BertLayer"]
         script = [f"{self.examples_dir_str}/pytorch/text-classification/run_glue.py"]
         cmd = launcher + script + args + fsdp_args
@@ -275,6 +284,20 @@ class TrainerIntegrationFSDP(TestCasePlus, TrainerIntegrationCommon):
         for log, log1 in zip(logs, logs_resume):
             if "learning_rate" in log:
                 self.assertAlmostEqual(log["learning_rate"], log1["learning_rate"], delta=1e-5)
+
+    @require_torch_multi_accelerator
+    @slow
+    @require_torch_accelerator
+    @require_fsdp
+    def test_fsdp_cpu_offloading(self):
+        try:
+            subprocess.run(
+                "accelerate launch utils/testing_scripts/fsdp_cpu_offloading.py --config utils/testing_scripts/dummy_fsdp_config.yml",
+                shell=True,
+                check=True,
+            )
+        except:  # noqa
+            raise AssertionError("CPU offloading failed with FSDP!")
 
     def run_cmd_and_get_logs(self, use_accelerate, sharding_strategy, launcher, script, args, output_dir):
         if not use_accelerate:

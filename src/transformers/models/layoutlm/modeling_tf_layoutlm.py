@@ -1601,7 +1601,7 @@ class TFLayoutLMForQuestionAnswering(TFLayoutLMPreTrainedModel, TFQuestionAnswer
         >>> tokenizer = AutoTokenizer.from_pretrained("impira/layoutlm-document-qa", add_prefix_space=True)
         >>> model = TFLayoutLMForQuestionAnswering.from_pretrained("impira/layoutlm-document-qa", revision="1e3ebac")
 
-        >>> dataset = load_dataset("nielsr/funsd", split="train")
+        >>> dataset = load_dataset("nielsr/funsd", split="train", trust_remote_code=True)
         >>> example = dataset[0]
         >>> question = "what's his name?"
         >>> words = example["words"]
@@ -1679,3 +1679,14 @@ class TFLayoutLMForQuestionAnswering(TFLayoutLMPreTrainedModel, TFQuestionAnswer
         if getattr(self, "qa_outputs", None) is not None:
             with tf.name_scope(self.qa_outputs.name):
                 self.qa_outputs.build([None, None, self.config.hidden_size])
+
+
+__all__ = [
+    "TFLayoutLMForMaskedLM",
+    "TFLayoutLMForSequenceClassification",
+    "TFLayoutLMForTokenClassification",
+    "TFLayoutLMForQuestionAnswering",
+    "TFLayoutLMMainLayer",
+    "TFLayoutLMModel",
+    "TFLayoutLMPreTrainedModel",
+]

@@ -59,7 +59,7 @@ def unwrap_and_save_reload_schedule(scheduler, num_steps=10):
                 file_name = os.path.join(tmpdirname, "schedule.bin")
                 torch.save(scheduler.state_dict(), file_name)
 
-                state_dict = torch.load(file_name)
+                state_dict = torch.load(file_name, weights_only=False)
                 scheduler.load_state_dict(state_dict)
     return lrs
 
@@ -209,5 +209,5 @@ class LambdaScheduleWrapper:
         return self.fn(*args, **kwargs)
 
     @classmethod
-    def wrap_scheduler(self, scheduler):
-        scheduler.lr_lambdas = list(map(self, scheduler.lr_lambdas))
+    def wrap_scheduler(cls, scheduler):
+        scheduler.lr_lambdas = list(map(cls, scheduler.lr_lambdas))

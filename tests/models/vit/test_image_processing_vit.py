@@ -17,7 +17,7 @@
 import unittest
 
 from transformers.testing_utils import require_torch, require_vision
-from transformers.utils import is_vision_available
+from transformers.utils import is_torchvision_available, is_vision_available
 
 from ...test_image_processing_common import ImageProcessingTestMixin, prepare_image_inputs
 
@@ -25,8 +25,11 @@ from ...test_image_processing_common import ImageProcessingTestMixin, prepare_im
 if is_vision_available():
     from transformers import ViTImageProcessor
 
+    if is_torchvision_available():
+        from transformers import ViTImageProcessorFast
 
-class ViTImageProcessingTester(unittest.TestCase):
+
+class ViTImageProcessingTester:
     def __init__(
         self,
         parent,
@@ -82,6 +85,7 @@ class ViTImageProcessingTester(unittest.TestCase):
 @require_vision
 class ViTImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
     image_processing_class = ViTImageProcessor if is_vision_available() else None
+    fast_image_processing_class = ViTImageProcessorFast if is_torchvision_available() else None
 
     def setUp(self):
         super().setUp()

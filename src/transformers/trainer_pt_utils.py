@@ -27,6 +27,7 @@ import warnings
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from itertools import chain
 from logging import StreamHandler
 from typing import Any, Dict, Iterator, List, Optional, Union
 
@@ -55,19 +56,8 @@ if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
 
 if is_torch_available():
-    from .pytorch_utils import is_torch_greater_or_equal_than_2_0
+    from torch.optim.lr_scheduler import LRScheduler
 
-    if is_torch_greater_or_equal_than_2_0:
-        from torch.optim.lr_scheduler import LRScheduler
-    else:
-        from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
-
-
-# this is used to suppress an undesired warning emitted by pytorch versions 1.4.2-1.7.0
-try:
-    from torch.optim.lr_scheduler import SAVE_STATE_WARNING
-except ImportError:
-    SAVE_STATE_WARNING = ""
 
 logger = logging.get_logger(__name__)
 
@@ -131,9 +121,10 @@ def nested_concat(tensors, new_tensors, padding_index=-100):
     Concat the `new_tensors` to `tensors` on the first dim and pad them on the second if needed. Works for tensors or
     nested list/tuples/dict of tensors.
     """
-    assert type(tensors) == type(
-        new_tensors
-    ), f"Expected `tensors` and `new_tensors` to have the same type but found {type(tensors)} and {type(new_tensors)}."
+    if not (isinstance(tensors, torch.Tensor) and isinstance(new_tensors, torch.Tensor)):
+        assert (
+            type(tensors) is type(new_tensors)
+        ), f"Expected `tensors` and `new_tensors` to have the same type but found {type(tensors)} and {type(new_tensors)}."
     if isinstance(tensors, (list, tuple)):
         return type(tensors)(nested_concat(t, n, padding_index=padding_index) for t, n in zip(tensors, new_tensors))
     elif isinstance(tensors, torch.Tensor):
@@ -190,7 +181,7 @@ def nested_detach(tensors):
         return type(tensors)(nested_detach(t) for t in tensors)
     elif isinstance(tensors, Mapping):
         return type(tensors)({k: nested_detach(t) for k, t in tensors.items()})
-    return tensors.detach()
+    return tensors.detach() if isinstance(tensors, torch.Tensor) else tensors
 
 
 def nested_xla_mesh_reduce(tensors, name):
@@ -249,10 +240,10 @@ def distributed_broadcast_scalars(
 
 
 def reissue_pt_warnings(caught_warnings):
-    # Reissue warnings that are not the SAVE_STATE_WARNING
+    # Reissue warnings
     if len(caught_warnings) > 1:
         for w in caught_warnings:
-            if w.category != UserWarning or w.message != SAVE_STATE_WARNING:
+            if w.category is not UserWarning:
                 warnings.warn(w.message, w.category)
 
 
@@ -1129,19 +1120,25 @@ def get_model_param_count(model, trainable_only=False):
     return sum(numel(p) for p in model.parameters() if not trainable_only or p.requires_grad)
 
 
-def get_parameter_names(model, forbidden_layer_types):
+def get_parameter_names(model, forbidden_layer_types, forbidden_layer_names=None):
     """
     Returns the names of the model parameters that are not inside a forbidden layer.
     """
+    if forbidden_layer_names is None:
+        forbidden_layer_names = []
     result = []
     for name, child in model.named_children():
+        child_params = get_parameter_names(child, forbidden_layer_types, forbidden_layer_names)
         result += [
             f"{name}.{n}"
-            for n in get_parameter_names(child, forbidden_layer_types)
+            for n in child_params
             if not isinstance(child, tuple(forbidden_layer_types))
+            and not any(forbidden in f"{name}.{n}".lower() for forbidden in forbidden_layer_names)
         ]
-    # Add model specific parameters (defined with nn.Parameter) since they are not in any child.
-    result += list(model._parameters.keys())
+    # Add model specific parameters that are not in any child
+    result += [
+        k for k in model._parameters.keys() if not any(forbidden in k.lower() for forbidden in forbidden_layer_names)
+    ]
     return result
 
 
@@ -1378,13 +1375,38 @@ class LayerWiseDummyScheduler(LRScheduler):
     """
 
     def __init__(self, *args, **kwargs):
-        optimizer = LayerWiseDummyOptimizer()
+        self.default_lr = kwargs["lr"]
+        optimizer = LayerWiseDummyOptimizer(**kwargs)
         last_epoch = -1
         verbose = False
         super().__init__(optimizer, last_epoch, verbose)
 
     def get_lr(self):
-        return [group["lr"] for group in self.optimizer.param_groups]
+        # default value
+        lrs = [self.default_lr]
+
+        # we take each lr in the parameters if they exist, assumes the optimizer to be the `LayerWiseDummyOptimizer`
+        if self.optimizer is not None:
+            param_wise_lrs = [
+                [group["lr"] for group in optim.param_groups] for optim in self.optimizer.optimizer_dict.values()
+            ]
+            lrs = list(chain(*param_wise_lrs))
+
+        return lrs
 
     def _get_closed_form_lr(self):
         return self.base_lrs
+
+
+def set_rng_state_for_device(device_name, device_module, checkpoint_rng_state, is_distributed):
+    """Helper to set RNG state for a specific device type (CUDA, NPU, MLU, MUSA)"""
+    device_state_key = device_name.lower()
+    err_template = "Didn't manage to set back the RNG states of the {backend} because of the following error:\n {exception}\nThis won't yield the same results as if the training had not been interrupted."
+    try:
+        if is_distributed:
+            device_module.random.set_rng_state_all(checkpoint_rng_state[device_state_key])
+        else:
+            device_module.random.set_rng_state(checkpoint_rng_state[device_state_key])
+    except Exception as e:
+        # Log error if setting RNG state fails
+        logger.error(err_template.format(backend=device_name, exception=e))

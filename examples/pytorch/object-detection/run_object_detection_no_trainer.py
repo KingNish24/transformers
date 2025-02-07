@@ -51,7 +51,7 @@ from transformers.utils.versions import require_version
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.42.0.dev0")
+check_min_version("4.49.0.dev0")
 
 logging.basicConfig(level=logging.INFO)
 logger = get_logger(__name__)
@@ -257,6 +257,12 @@ def parse_args():
         help="Image longest size will be resized to this value, then image will be padded to square.",
     )
     parser.add_argument(
+        "--use_fast",
+        type=bool,
+        default=True,
+        help="Use a fast torchvision-base image processor if it is supported for a given model.",
+    )
+    parser.add_argument(
         "--cache_dir",
         type=str,
         help="Path to a folder in which the model and dataset will be cached.",
@@ -340,12 +346,11 @@ def parse_args():
     parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
     parser.add_argument(
         "--trust_remote_code",
-        type=bool,
-        default=False,
+        action="store_true",
         help=(
-            "Whether or not to allow for custom models defined on the Hub in their own modeling files. This option "
-            "should only be set to `True` for repositories you trust and in which you have read the code, as it will "
-            "execute code present on the Hub on your local machine."
+            "Whether to trust the execution of code from datasets/models defined on the Hub."
+            " This option should only be set to `True` for repositories you trust and in which you have read the"
+            " code, as it will execute code present on the Hub on your local machine."
         ),
     )
     parser.add_argument(
@@ -445,7 +450,7 @@ def main():
     # Load dataset
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    dataset = load_dataset(args.dataset_name, cache_dir=args.cache_dir)
+    dataset = load_dataset(args.dataset_name, cache_dir=args.cache_dir, trust_remote_code=args.trust_remote_code)
 
     # If we don't have a validation split, split off a percentage of train as validation.
     args.train_val_split = None if "validation" in dataset.keys() else args.train_val_split
@@ -483,6 +488,7 @@ def main():
         size={"max_height": args.image_square_size, "max_width": args.image_square_size},
         do_pad=True,
         pad_size={"height": args.image_square_size, "width": args.image_square_size},
+        use_fast=args.use_fast,
         **common_pretrained_args,
     )
 
@@ -678,7 +684,7 @@ def main():
                 completed_steps += 1
 
             if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0:
+                if completed_steps % checkpointing_steps == 0 and accelerator.sync_gradients:
                     output_dir = f"step_{completed_steps}"
                     if args.output_dir is not None:
                         output_dir = os.path.join(args.output_dir, output_dir)

@@ -515,10 +515,17 @@ class ClapModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
 
     def setUp(self):
         self.model_tester = ClapModelTester(self)
+        common_properties = ["logit_scale_init_value", "projection_hidden_act", "projection_dim"]
+        self.config_tester = ConfigTester(
+            self, config_class=ClapConfig, has_text_modality=False, common_properties=common_properties
+        )
 
     def test_model(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_model(*config_and_inputs)
+
+    def test_config(self):
+        self.config_tester.run_common_tests()
 
     @unittest.skip(reason="Hidden_states is tested in individual model tests")
     def test_hidden_states_output(self):
@@ -562,7 +569,7 @@ class ClapModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
 
     def _create_and_check_torchscript(self, config, inputs_dict):
         if not self.test_torchscript:
-            return
+            self.skipTest(reason="test_torchscript is set to False")
 
         configs_no_init = _config_zero_init(config)  # To be sure we have no Nan
         configs_no_init.torchscript = True

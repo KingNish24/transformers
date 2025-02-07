@@ -51,7 +51,7 @@ class OlmoConfig(PretrainedConfig):
         num_key_value_heads (`int`, *optional*):
             This is the number of key_value heads that should be used to implement Grouped Query Attention. If
             `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
-            `num_key_value_heads=1 the model will use Multi Query Attention (MQA) otherwise GQA is used. When
+            `num_key_value_heads=1` the model will use Multi Query Attention (MQA) otherwise GQA is used. When
             converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
             by meanpooling all the original heads within that group. For more details checkout [this
             paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
@@ -106,6 +106,15 @@ class OlmoConfig(PretrainedConfig):
 
     model_type = "olmo"
     keys_to_ignore_at_inference = ["past_key_values"]
+    base_model_tp_plan = {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.k_proj": "colwise",
+        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.o_proj": "rowwise",
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+    }
 
     def __init__(
         self,
@@ -160,7 +169,6 @@ class OlmoConfig(PretrainedConfig):
             **kwargs,
         )
 
-    # Copied from transformers.models.llama.configuration_llama.LlamaConfig._rope_scaling_validation
     def _rope_scaling_validation(self):
         """
         Validate the `rope_scaling` configuration.

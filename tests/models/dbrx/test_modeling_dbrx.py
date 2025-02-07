@@ -350,21 +350,21 @@ class DbrxModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin
         model = DbrxModel.from_pretrained(model_name)
         self.assertIsNotNone(model)
 
-    @unittest.skip("Dbrx models have weight tying disabled.")
+    @unittest.skip(reason="Dbrx models have weight tying disabled.")
     def test_tied_weights_keys(self):
         pass
 
     # Offload does not work with Dbrx models because of the forward of DbrxExperts where we chunk the experts.
     # The issue is that the offloaded weights of the mlp layer are still on meta device (w1_chunked, v1_chunked, w2_chunked)
-    @unittest.skip("Dbrx models do not work with offload")
+    @unittest.skip(reason="Dbrx models do not work with offload")
     def test_cpu_offload(self):
         pass
 
-    @unittest.skip("Dbrx models do not work with offload")
+    @unittest.skip(reason="Dbrx models do not work with offload")
     def test_disk_offload_safetensors(self):
         pass
 
-    @unittest.skip("Dbrx models do not work with offload")
+    @unittest.skip(reason="Dbrx models do not work with offload")
     def test_disk_offload_bin(self):
         pass
 
@@ -390,4 +390,4 @@ class DbrxModelIntegrationTest(unittest.TestCase):
                 ]
             ]
         )
-        self.assertTrue(torch.allclose(output[:, :3, :3], expected_slice, atol=1e-4))
+        torch.testing.assert_close(output[:, :3, :3], expected_slice, rtol=1e-4, atol=1e-4)

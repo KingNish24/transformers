@@ -38,7 +38,7 @@ if is_vision_available():
     from transformers import ImageGPTImageProcessor
 
 
-class ImageGPTImageProcessingTester(unittest.TestCase):
+class ImageGPTImageProcessingTester:
     def __init__(
         self,
         parent,
@@ -176,7 +176,7 @@ class ImageGPTImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
                 else:
                     self.assertEqual(image_processor_first[key], value)
 
-    @unittest.skip("ImageGPT requires clusters at initialization")
+    @unittest.skip(reason="ImageGPT requires clusters at initialization")
     def test_init_without_params(self):
         pass
 
@@ -220,7 +220,7 @@ class ImageGPTImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             tuple(encoded_images.shape), (self.image_processor_tester.batch_size, *expected_output_image_shape)
         )
 
-    @unittest.skip("ImageGPT assumes clusters for 3 channels")
+    @unittest.skip(reason="ImageGPT assumes clusters for 3 channels")
     def test_call_numpy_4_channels(self):
         pass
 

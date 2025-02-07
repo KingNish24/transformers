@@ -82,7 +82,6 @@ class UperNetModelTester:
         self.out_features = out_features
         self.num_labels = num_labels
         self.scope = scope
-        self.num_hidden_layers = num_stages
 
     def prepare_config_and_inputs(self):
         pixel_values = floats_tensor([self.batch_size, self.num_channels, self.image_size, self.image_size])
@@ -161,19 +160,16 @@ class UperNetModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase)
 
     def setUp(self):
         self.model_tester = UperNetModelTester(self)
-        self.config_tester = ConfigTester(self, config_class=UperNetConfig, has_text_modality=False, hidden_size=37)
+        self.config_tester = ConfigTester(
+            self,
+            config_class=UperNetConfig,
+            has_text_modality=False,
+            hidden_size=37,
+            common_properties=["hidden_size"],
+        )
 
     def test_config(self):
-        self.create_and_test_config_common_properties()
-        self.config_tester.create_and_test_config_to_json_string()
-        self.config_tester.create_and_test_config_to_json_file()
-        self.config_tester.create_and_test_config_from_and_save_pretrained()
-        self.config_tester.create_and_test_config_with_num_labels()
-        self.config_tester.check_config_can_be_init_without_params()
-        self.config_tester.check_config_arguments_init()
-
-    def create_and_test_config_common_properties(self):
-        return
+        self.config_tester.run_common_tests()
 
     def test_for_semantic_segmentation(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
@@ -314,7 +310,7 @@ class UperNetModelIntegrationTest(unittest.TestCase):
         expected_slice = torch.tensor(
             [[-7.5958, -7.5958, -7.4302], [-7.5958, -7.5958, -7.4302], [-7.4797, -7.4797, -7.3068]]
         ).to(torch_device)
-        self.assertTrue(torch.allclose(outputs.logits[0, 0, :3, :3], expected_slice, atol=1e-4))
+        torch.testing.assert_close(outputs.logits[0, 0, :3, :3], expected_slice, rtol=1e-4, atol=1e-4)
 
     def test_inference_convnext_backbone(self):
         processor = AutoImageProcessor.from_pretrained("openmmlab/upernet-convnext-tiny")
@@ -332,4 +328,4 @@ class UperNetModelIntegrationTest(unittest.TestCase):
         expected_slice = torch.tensor(
             [[-8.8110, -8.8110, -8.6521], [-8.8110, -8.8110, -8.6521], [-8.7746, -8.7746, -8.6130]]
         ).to(torch_device)
-        self.assertTrue(torch.allclose(outputs.logits[0, 0, :3, :3], expected_slice, atol=1e-4))
+        torch.testing.assert_close(outputs.logits[0, 0, :3, :3], expected_slice, rtol=1e-4, atol=1e-4)

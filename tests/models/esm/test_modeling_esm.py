@@ -290,11 +290,11 @@ class EsmModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
         self.assertEqual(position_ids.shape, expected_positions.shape)
         self.assertTrue(torch.all(torch.eq(position_ids, expected_positions)))
 
-    @unittest.skip("Esm does not support embedding resizing")
+    @unittest.skip(reason="Esm does not support embedding resizing")
     def test_resize_embeddings_untied(self):
         pass
 
-    @unittest.skip("Esm does not support embedding resizing")
+    @unittest.skip(reason="Esm does not support embedding resizing")
     def test_resize_tokens_embeddings(self):
         pass
 
@@ -317,7 +317,7 @@ class EsmModelIntegrationTest(TestCasePlus):
             expected_slice = torch.tensor(
                 [[[8.9215, -10.5898, -6.4671], [-6.3967, -13.9114, -1.1212], [-7.7812, -13.9516, -3.7406]]]
             )
-            self.assertTrue(torch.allclose(output[:, :3, :3], expected_slice, atol=1e-4))
+            torch.testing.assert_close(output[:, :3, :3], expected_slice, rtol=1e-4, atol=1e-4)
 
     def test_inference_no_head(self):
         with torch.no_grad():
@@ -330,7 +330,7 @@ class EsmModelIntegrationTest(TestCasePlus):
             expected_slice = torch.tensor(
                 [[[0.1444, 0.5413, 0.3248], [0.3034, 0.0053, 0.3108], [0.3228, -0.2499, 0.3415]]]
             )
-            self.assertTrue(torch.allclose(output[:, :3, :3], expected_slice, atol=1e-4))
+            torch.testing.assert_close(output[:, :3, :3], expected_slice, rtol=1e-4, atol=1e-4)
 
     @require_bitsandbytes
     def test_inference_bitsandbytes(self):

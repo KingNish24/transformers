@@ -27,6 +27,7 @@ from transformers import Pix2StructConfig, Pix2StructTextConfig, Pix2StructVisio
 from transformers.testing_utils import require_torch, require_vision, slow, torch_device
 from transformers.utils import is_torch_available, is_vision_available
 
+from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import (
     ModelTesterMixin,
@@ -388,6 +389,7 @@ class Pix2StructModelTester:
         self.batch_size = self.text_model_tester.batch_size  # need bs for batching_equivalence test
         self.seq_length = self.text_model_tester.seq_length  # need seq_length for common tests
         self.is_training = is_training
+        self.max_patches = self.vision_model_tester.max_patches
 
     def prepare_config_and_inputs(self):
         text_config, input_ids, attention_mask = self.text_model_tester.prepare_config_and_inputs()
@@ -417,9 +419,14 @@ class Pix2StructModelTester:
 
 
 @require_torch
-class Pix2StructModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
+class Pix2StructModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (Pix2StructForConditionalGeneration,) if is_torch_available() else ()
-    pipeline_model_mapping = {"image-to-text": Pix2StructForConditionalGeneration} if is_torch_available() else {}
+    all_generative_model_classes = (Pix2StructForConditionalGeneration,) if is_torch_available() else {}
+    pipeline_model_mapping = (
+        {"image-to-text": Pix2StructForConditionalGeneration, "image-text-to-text": Pix2StructForConditionalGeneration}
+        if is_torch_available()
+        else {}
+    )
     fx_compatible = False
     test_head_masking = False
     test_pruning = False
@@ -444,6 +451,16 @@ class Pix2StructModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCa
                     self.model_tester.text_model_tester.vocab_size,
                 ),
             )
+
+    def test_generative_model(self):
+        config, input_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        for model_class in self.all_generative_model_classes:
+            model = model_class(config).eval().to(torch_device)
+
+            output = model.generate(**input_dict, use_cache=False, min_new_tokens=10, max_new_tokens=10)
+            output_use_cache = model.generate(**input_dict, use_cache=True, min_new_tokens=10, max_new_tokens=10)
+
+            torch.testing.assert_close(output, output_use_cache)
 
     @unittest.skip(reason="Hidden_states is tested in individual model tests")
     def test_hidden_states_output(self):
@@ -489,7 +506,7 @@ class Pix2StructModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCa
 
     def test_training(self):
         if not self.model_tester.is_training:
-            return
+            self.skipTest(reason="model_tester.is_training is set to False")
 
         for model_class in self.all_model_classes[:-1]:
             config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
@@ -508,7 +525,7 @@ class Pix2StructModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCa
 
     def test_training_gradient_checkpointing(self):
         if not self.model_tester.is_training:
-            return
+            self.skipTest(reason="model_tester.is_training is set to False")
 
         for model_class in self.all_model_classes[:-1]:
             config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
@@ -555,7 +572,7 @@ class Pix2StructModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCa
     def test_resize_tokens_embeddings(self):
         original_config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
         if not self.test_resize_embeddings:
-            return
+            self.skipTest(reason="test_resize_embeddings is set to False")
 
         for model_class in self.all_model_classes:
             config = copy.deepcopy(original_config)
@@ -602,13 +619,13 @@ class Pix2StructModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCa
     def test_resize_embeddings_untied(self):
         original_config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
         if not self.test_resize_embeddings:
-            return
+            self.skipTest(reason="test_resize_embeddings is set to False")
 
         original_config.tie_word_embeddings = False
 
         # if model cannot untied embeddings -> leave test
         if original_config.tie_word_embeddings:
-            return
+            self.skipTest(reason="Model cannot untie embeddings")
 
         for model_class in self.all_model_classes:
             config = copy.deepcopy(original_config)
@@ -652,7 +669,7 @@ class Pix2StructModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCa
 
     def _create_and_check_torchscript(self, config, inputs_dict):
         if not self.test_torchscript:
-            return
+            self.skipTest(reason="test_torchscript is set to False")
 
         configs_no_init = _config_zero_init(config)  # To be sure we have no Nan
         configs_no_init.torchscript = True
@@ -735,6 +752,26 @@ class Pix2StructModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCa
             config.save_pretrained(tmp_dir_name)
             text_config = Pix2StructTextConfig.from_pretrained(tmp_dir_name)
             self.assertDictEqual(config.text_config.to_dict(), text_config.to_dict())
+
+    def _check_encoder_attention_for_generate(self, attentions, batch_size, config, seq_length):
+        # overwrite because # pix2struct seq length depends on image inputs
+        seq_length = self.model_tester.max_patches
+        encoder_expected_shape = (batch_size, config.num_attention_heads, seq_length, seq_length)
+        self.assertIsInstance(attentions, tuple)
+        self.assertListEqual(
+            [layer_attentions.shape for layer_attentions in attentions],
+            [encoder_expected_shape] * len(attentions),
+        )
+
+    def _check_encoder_hidden_states_for_generate(self, hidden_states, batch_size, config, seq_length):
+        # overwrite because # pix2struct seq length depends on image inputs
+        seq_length = self.model_tester.max_patches
+        encoder_expected_shape = (batch_size, seq_length, config.hidden_size)
+        self.assertIsInstance(hidden_states, tuple)
+        self.assertListEqual(
+            [layer_hidden_states.shape for layer_hidden_states in hidden_states],
+            [encoder_expected_shape] * len(hidden_states),
+        )
 
 
 # We will verify our results on an image of a stop sign

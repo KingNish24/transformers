@@ -137,7 +137,7 @@ class JsonSchemaGeneratorTest(unittest.TestCase):
                 "properties": {
                     "x": {
                         "type": "array",
-                        "items": {"type": "array", "items": {"type": ["string", "integer"]}},
+                        "items": {"type": "array", "items": {"type": ["integer", "string"]}},
                         "description": "The input",
                     }
                 },
@@ -419,6 +419,31 @@ class JsonSchemaGeneratorTest(unittest.TestCase):
 
         self.assertEqual(schema["function"], expected_schema)
 
+    def test_return_none(self):
+        def fn(x: int) -> None:
+            """
+            Test function
+
+            Args:
+                x: The first input
+            """
+            pass
+
+        schema = get_json_schema(fn)
+        expected_schema = {
+            "name": "fn",
+            "description": "Test function",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "The first input"},
+                },
+                "required": ["x"],
+            },
+            "return": {"type": "null"},
+        }
+        self.assertEqual(schema["function"], expected_schema)
+
     def test_everything_all_at_once(self):
         def fn(
             x: str, y: Optional[List[Union[str, int]]], z: Tuple[Union[str, int], str] = (42, "hello")
@@ -455,13 +480,13 @@ class JsonSchemaGeneratorTest(unittest.TestCase):
                     },
                     "y": {
                         "type": "array",
-                        "items": {"type": ["string", "integer"]},
+                        "items": {"type": ["integer", "string"]},
                         "nullable": True,
                         "description": "The second input. It's a big list with a single-line description.",
                     },
                     "z": {
                         "type": "array",
-                        "prefixItems": [{"type": ["string", "integer"]}, {"type": "string"}],
+                        "prefixItems": [{"type": ["integer", "string"]}, {"type": "string"}],
                         "description": "The third input. It's some kind of tuple with a default arg.",
                     },
                 },
